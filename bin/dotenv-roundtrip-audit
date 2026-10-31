@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+dotenv-roundtrip-audit
+
+Read a .env file, and for every KEY=value line detect whether a value that was
+*intended* to be read back through a typical dotenv reader (python-dotenv style)
+actually round-trips losslessly, or whether it was written with *shell* quoting
+(the pattern upstream mattpocock/skills `write_env` uses: `KEY='...'` with `'`
+escaped as `'\''`) and therefore gets corrupted when a dotenv reader parses it.
+
+It models two readers on the same byte-for-byte line:
+  shell_reader  -> what `source`/bash intends the value to be
+  dotenv_reader -> what a common dotenv library (python-dotenv semantics) returns
+
+A value is flagged as a defect when:
+  - the dotenv line is unterminated (a single-quoted value spans rows / never
+    closes) -> the write is corrupt at parse time (multiline / PEM-key case); or
+  - shell_reader != dotenv_reader -> the shell-quoted form is not understood by
+    dotenv readers (apostrophe `'\''`, escape, backslash, `#`/`$`-in-adjacent
+    text, etc.), so the value silently changes shape on read-back.
+
+Exit codes: 0 = no corruption, 1 = corruption(s) found, 2 = usage/input error.
+"""
+
+import json
+import os
+import re
+import sys
+
+SHELL_APOS_ENCODING = "'\\''"      # shell single-quote escape for an apostrophe
+APOS_BARE = "'"
+
+
+def dotenv_parse_value(raw):
+    """Parse one value with python-dotenv semantics. Returns (value, ok).
+    ok=False means the line is unterminated/corrupt at dotenv-parse time."""
+    if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
+        # dotenv single-quoted: literal, no escapes. Trailing newline trimmed.
+        inner = raw[1:-1]
+        if inner.endswith("\r"):
+            inner = inner[:-1]
+        return inner, True
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        inner = raw[1:-1]
+        out = []
+        i = 0
+        esc = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "$": "$",
+               "\n": "\n"}
+        while i < len(inner):
+            ch = inner[i]
+            if ch == "\\" and i + 1 < len(inner):
+                nxt = inner[i + 1]
+                if nxt in esc:
+                    out.append(esc[nxt])
+                    i += 2
+                    continue
+                # unknown escape: dotenv keeps backslash
+                out.append("\\")
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out), True
+    # unquoted: no quote processing, strip trailing comment marker implicitly
+    # (python-dotenv leaves unquoted as-is except trailing newline/space).
+    return raw.rstrip("\r"), True
+
+
+def shell_parse_value(raw):
+    """Parse one value assuming the upstream write_env shell form:
+    KEY='...any chars, apostrophe as '\'' ....'
+    Returns (value, ok, is_shell_form).  is_shell_form is True only for a
+    single-quoted (write_env-style) value."""
+    if not raw.startswith("'"):
+        # Not a write_env single-quoted form (plain / doubly-quoted dotenv).
+        return raw, True, False
+    # single-quoted form: must close on the same line
+    if not raw.endswith("'") or len(raw) == 1:
+        # Unterminated single quote: value spilled across rows (multiline/PEM).
+        return None, False, True
+    inner = raw[1:-1]
+    decoded = inner.replace(SHELL_APOS_ENCODING, APOS_BARE)
+    return decoded, True, True
+
+
+def parse_dotenv(text):
+    """Yield (line_no, key, raw, dotenv_val, dotenv_ok, shell_val, shell_ok,
+    is_shell_form)."""
+    out = []
+    for ln, line in enumerate(text.splitlines(), 1):
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = re.match(r"^(export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+        if not m:
+            continue
+        key = m.group(2)
+        raw = m.group(3)
+        dv, dok = dotenv_parse_value(raw)
+        sv, sok, sh = shell_parse_value(raw)
+        out.append((ln, key, raw, dv, dok, sv, sok, sh))
+    return out
+
+
+def audit(text):
+    """Return dict {corruptions:[...], clear:[...]}."""
+    findings = []
+    clear = []
+    for ln, key, raw, dv, dok, sv, sok, sh in parse_dotenv(text):
+        # 1) unterminated / multiline corruption: write_env single-quoted value
+        #    whose closing quote is missing -> value spilled across rows
+        if sh and (not sok or sv is None):
+            findings.append({
+                "line": ln, "key": key, "kind": "unterminated-multiline",
+                "detail": ("value written via shell single quotes has no "
+                           "closing quote on this line (multiline/PEM-like "
+                           "value); dotenv readers see a broken file"),
+            })
+            continue
+        # 2) For shell single-quoted (write_env) forms only, check the value
+        #    round-trips losslessly through a dotenv reader.  Dotenv-native
+        #    doubly-quoted/plain values are not the write_env pattern.
+        if sh:
+            if not dok:
+                findings.append({
+                    "line": ln, "key": key, "kind": "dotenv-unterminated",
+                    "detail": f"raw {raw!r} is corrupt for a dotenv reader",
+                })
+                continue
+            if sv != dv:
+                findings.append({
+                    "line": ln, "key": key, "kind": "roundtrip-mismatch",
+                    "detail": ("shell single-quoted write_env encoding "
+                               f"decodes to {sv!r} but a dotenv reader decodes "
+                               f"to {dv!r}; apostrophes written via '\\'' are "
+                               "not understood by dotenv readers"),
+                    "shell": sv, "dotenv": dv,
+                })
+                continue
+        clear.append({"line": ln, "key": key})
+    return {"corruptions": findings, "clear": clear}
+
+
+def main(argv):
+    argv = argv[1:]
+    if not argv:
+        sys.stderr.write("usage: dotenv-roundtrip-audit <file.env> [--json]\n")
+        return 2
+    path = argv[0]
+    want_json = "--json" in argv
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        sys.stderr.write(f"error: cannot read {path}: {exc}\n")
+        return 2
+
+    res = audit(text)
+    problems = len(res["corruptions"])
+    keys_total = len(res["clear"]) + problems
+
+    if want_json:
+        report = {
+            "file": path,
+            "total_keys": keys_total,
+            "corrupt_count": problems,
+            "exit_code": 0 if problems == 0 else 1,
+            "corruptions": res["corruptions"],
+        }
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        if problems:
+            for c in res["corruptions"]:
+                print(f"line {c['line']:>4}: [{c['kind']}] {c['key']}: "
+                      f"{c['detail']}")
+            print(f"corruptions: {problems}/{keys_total}")
+        else:
+            print(f"ok: {keys_total} key(s) round-trip cleanly")
+    return 0 if problems == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

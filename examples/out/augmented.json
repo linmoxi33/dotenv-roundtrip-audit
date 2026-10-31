@@ -1,0 +1,22 @@
+{
+  "file": "examples/in/augmented.env",
+  "total_keys": 3,
+  "corrupt_count": 2,
+  "exit_code": 1,
+  "corruptions": [
+    {
+      "line": 3,
+      "key": "GREETING",
+      "kind": "roundtrip-mismatch",
+      "detail": "shell single-quoted write_env encoding decodes to \"It's a trap\" but a dotenv reader decodes to \"It'\\\\''s a trap\"; apostrophes written via '\\'' are not understood by dotenv readers",
+      "shell": "It's a trap",
+      "dotenv": "It'\\''s a trap"
+    },
+    {
+      "line": 5,
+      "key": "PRIVATE_KEY",
+      "kind": "unterminated-multiline",
+      "detail": "value written via shell single quotes has no closing quote on this line (multiline/PEM-like value); dotenv readers see a broken file"
+    }
+  ]
+}
